@@ -1,356 +1,309 @@
-// main.ts — deterministic momentum + quota paper-trading bot for agent-fun/replay/v2
-import { runBot, LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
+// Pump.fun replay bot — momentum entries with a parallel quota lane.
+//
+// Idea in one paragraph: most new curves go nowhere, so this bot spends
+// most batches just watching. It keeps a small ledger for every mint it
+// sees, scores the early flow, and only commits real size when several
+// independent buyers have already pushed meaningful SOL through a young
+// curve without one wallet dominating. In parallel it runs tiny round
+// trips on other coins, because the ranking guardrail asks for round
+// trips of at least 0.01 SOL on twenty distinct coins and a bot that
+// waits for perfect momentum may never reach that count. Exits are
+// rule based and checked before any new entry on every batch.
+//
+// Determinism: no clock, no randomness, no floating point. All money
+// maths is bigint, counters are batch counts, and every map is walked
+// in insertion order, which follows the order of the replay itself.
 
-// ───────────────────────── Parameters ─────────────────────────
-const SOL = LAMPORTS_PER_SOL as bigint;
-const START_EQUITY = 10n * SOL;
-const OBS_MIN_TRADES = 15; // trades observed before momentum entry
-const MIN_NET_INFLOW = (SOL * 3n) / 2n; // 1.5 SOL
+import { LAMPORTS_PER_SOL, runBot, type OrderInput } from './vendor/makefun-bot.ts';
+
+// ---- tuning, all in lamports or batch counts --------------------------
+
+const MOMENTUM_STAKE = LAMPORTS_PER_SOL / 4n; // 0.25 SOL before scaling
+const QUOTA_STAKE = LAMPORTS_PER_SOL / 50n; // 0.02 SOL, above the 0.01 bar
+const MIN_NET_INFLOW = (LAMPORTS_PER_SOL * 3n) / 2n; // 1.5 SOL
+const MAX_YOUNG_RESERVE = LAMPORTS_PER_SOL * 20n;
+const EXPOSURE_CEILING = (LAMPORTS_PER_SOL * 5n) / 4n; // 1.25 SOL at cost
 const MIN_DISTINCT_BUYERS = 8;
-const MAX_SINGLE_TRADE_SHARE_BPS = 3000n; // 30% of gross buy volume
-const MAX_REAL_RESERVE_AT_ENTRY = 20n * SOL;
-const MAX_ENTRY_AGE_BATCHES = 30; // must be young (tape time in batches)
-const BASE_SIZE = SOL / 4n; // 0.25 SOL
-const MAX_SIZE_BPS_OF_EQUITY = 300n; // 3%
-const QUOTA_SIZE = SOL / 50n; // 0.02 SOL
-const MIN_ROUND_TRIP = SOL / 100n; // 0.01 SOL
 const QUOTA_TARGET = 20;
-const QUOTA_MIN_TRADES = 3; // a mint must show some life for a quota trade
-const QUOTA_MAX_AGE_BATCHES = 60;
-const TAKE_PROFIT_BPS = 4000n; // +40%
-const STOP_LOSS_BPS = 2000n; // -20%
-const TIME_STOP_BATCHES = 40;
-const QUOTA_TIME_STOP_BATCHES = 12;
-const NEG_FLOW_EXIT = -(SOL * 1n); // net -1 SOL flow over recent window
-const COMPLETION_GUARD_RESERVE = 68n * SOL; // ~80% of completion reserve
-const BUY_SLIPPAGE_BPS = 300;
-const SELL_SLIPPAGE_BPS = 800;
-const SELL_RETRY_SLIPPAGE_BPS = 1500;
-const SELL_RETRY_AFTER_BATCHES = 2;
-const FEE_RESERVE = SOL / 20n; // 0.05 SOL
-const HALF_SIZE_EQUITY = (SOL * 85n) / 10n; // 8.5 SOL
-const QUOTA_ONLY_EQUITY = (SOL * 75n) / 10n; // 7.5 SOL
-const MAX_TOTAL_EXPOSURE = (SOL * 125n) / 100n; // 1.25 SOL at cost
-const PENDING_BUY_TIMEOUT_BATCHES = 5;
+const MOMENTUM_HOLD_BATCHES = 140;
+const QUOTA_HOLD_BATCHES = 30;
+const BASE_SLIPPAGE_BPS = 800;
+const COMPLETION_RESERVE = LAMPORTS_PER_SOL * 68n;
+const EQUITY_SOFT_FLOOR = (LAMPORTS_PER_SOL * 17n) / 2n; // 8.5 SOL
+const EQUITY_HARD_FLOOR = (LAMPORTS_PER_SOL * 15n) / 2n; // 7.5 SOL
 
-// ───────────────────────── Helpers ─────────────────────────
-function big(v: unknown): bigint | undefined {
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number' && Number.isFinite(v)) return BigInt(Math.trunc(v));
-  if (typeof v === 'string' && /^-?\d+$/.test(v)) return BigInt(v);
-  return undefined;
+// Slippage widens each time an exit has to be retried, so a position
+// that slipped once is not retried forever on the same tight terms.
+function exitSlippage(attempts: number): number {
+  if (attempts <= 0) return BASE_SLIPPAGE_BPS;
+  if (attempts === 1) return 2_500;
+  if (attempts === 2) return 5_000;
+  return 10_000;
 }
 
-function pick(o: any, ...keys: string[]): any {
-  if (o == null) return undefined;
-  for (const k of keys) if (o[k] !== undefined && o[k] !== null) return o[k];
-  return undefined;
+// Rough mark-to-market equity: cash plus every holding at spot. Used
+// only as a risk throttle, never as a reported figure.
+function markedEquity(
+  state: {
+    cash: bigint;
+    positions: Map<string, { token_amount: bigint; cost_lamports: bigint }>;
+    curves: Map<string, { virtual_token_reserves: bigint; virtual_quote_reserves: bigint }>;
+  },
+): bigint {
+  let total = state.cash;
+  for (const [mint, pos] of state.positions) {
+    const v = spotValue(state, mint, pos.token_amount);
+    total += v === null ? pos.cost_lamports : v;
+  }
+  return total;
 }
 
-function minB(...xs: bigint[]): bigint {
-  let m = xs[0];
-  for (const x of xs) if (x < m) m = x;
-  return m;
-}
+// ---- per-mint observation ledger --------------------------------------
 
-function maxB(a: bigint, b: bigint): bigint { return a > b ? a : b; }
-
-function cmpStr(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }
-
-type Kind = 'create' | 'trade' | 'complete' | 'other';
-
-function eventKind(ev: any): Kind {
-  const raw = String(pick(ev, 'kind', 'type', 'event', 'event_type', 'name') ?? ev?.constructor?.name ?? '').toLowerCase();
-  if (raw.includes('complete')) return 'complete';
-  if (raw.includes('create')) return 'create';
-  if (raw.includes('trade')) return 'trade';
-  if (pick(ev, 'is_buy', 'isBuy') !== undefined) return 'trade';
-  return 'other';
-}
-
-// ───────────────────────── State ─────────────────────────
-interface MintStats {
-  mint: string;
-  createdBatch: number;
-  creator?: string;
-  trades: number;
+interface Watch {
+  creator: string;
+  bornAtBatch: number;
+  buyQuote: bigint;
+  sellQuote: bigint;
+  biggestBuy: bigint;
   buyers: Set<string>;
-  netInflow: bigint;
-  grossBuy: bigint;
-  maxBuyTrade: bigint;
-  creatorSold: boolean;
-  priceNum: bigint; // lamports
-  priceDen: bigint; // tokens
-  realSol: bigint;
-  complete: boolean;
-  recentFlow: bigint[]; // per-batch net flow, last few batches
+  tradesSeen: number;
+  creatorHasSold: boolean;
+  flowAfterEntry: bigint;
 }
 
-interface PosMeta {
-  mint: string;
-  entryBatch: number;
-  costIntent: bigint;
-  quota: boolean;
-  filled: boolean;
-  sellBatch: number; // -1 = not selling
+interface OpenNote {
+  lane: 'momentum' | 'quota';
+  openedAtBatch: number;
   sellAttempts: number;
+  exitWanted: boolean;
 }
 
-const stats = new Map<string, MintStats>();
-const meta = new Map<string, PosMeta>();
-const everEntered = new Set<string>();
-const roundTripped = new Set<string>();
-let batchNo = 0;
+const watched = new Map<string, Watch>();
+const notes = new Map<string, OpenNote>();
+const quotaAttempted = new Set<string>();
+const roundTripsDone = new Set<string>();
+const momentumAttempted = new Set<string>();
 
-function getStats(mint: string): MintStats {
-  let s = stats.get(mint);
-  if (!s) {
-    s = {
-      mint, createdBatch: batchNo, trades: 0, buyers: new Set(), netInflow: 0n, grossBuy: 0n,
-      maxBuyTrade: 0n, creatorSold: false, priceNum: 0n, priceDen: 0n, realSol: 0n,
-      complete: false, recentFlow: [],
-    };
-    stats.set(mint, s);
+let batchCounter = 0;
+
+function noteFor(mint: string, lane: 'momentum' | 'quota'): OpenNote {
+  let n = notes.get(mint);
+  if (n === undefined) {
+    n = { lane, openedAtBatch: batchCounter, sellAttempts: 0, exitWanted: false };
+    notes.set(mint, n);
   }
-  return s;
+  return n;
 }
 
-function ingest(ev: any, flowThisBatch: Map<string, bigint>): void {
-  const mint = String(pick(ev, 'mint'));
-  if (!mint || mint === 'undefined') return;
-  const k = eventKind(ev);
-  const s = getStats(mint);
-  if (k === 'create') {
-    s.createdBatch = batchNo;
-    const c = pick(ev, 'creator', 'user', 'owner');
-    if (c !== undefined) s.creator = String(c);
-  } else if (k === 'complete') {
-    s.complete = true;
-  } else if (k === 'trade') {
-    const isBuy = Boolean(pick(ev, 'is_buy', 'isBuy') ?? (pick(ev, 'side') === 'buy'));
-    const sol = big(pick(ev, 'sol_amount', 'solAmount', 'quote_lamports', 'lamports')) ?? 0n;
-    const tok = big(pick(ev, 'token_amount', 'tokenAmount')) ?? 0n;
-    const user = String(pick(ev, 'user', 'trader', 'wallet', 'signer') ?? '');
-    s.trades++;
-    if (isBuy) {
-      s.netInflow += sol;
-      s.grossBuy += sol;
-      if (sol > s.maxBuyTrade) s.maxBuyTrade = sol;
-      if (user) s.buyers.add(user);
-    } else {
-      s.netInflow -= sol;
-      if (s.creator && user === s.creator) s.creatorSold = true;
-    }
-    flowThisBatch.set(mint, (flowThisBatch.get(mint) ?? 0n) + (isBuy ? sol : -sol));
-    const vSol = big(pick(ev, 'virtual_sol_reserves', 'virtualSolReserves'));
-    const vTok = big(pick(ev, 'virtual_token_reserves', 'virtualTokenReserves'));
-    if (vSol !== undefined && vTok !== undefined && vTok > 0n) {
-      s.priceNum = vSol; s.priceDen = vTok;
-    } else if (sol > 0n && tok > 0n) {
-      s.priceNum = sol; s.priceDen = tok;
-    }
-    const rs = big(pick(ev, 'real_sol_reserves', 'realSolReserves'));
-    if (rs !== undefined) s.realSol = rs;
+// Spot value of a holding from the virtual reserves of its curve.
+// Returns null when the curve is unknown or has no usable reserves.
+function spotValue(
+  state: { curves: Map<string, { virtual_token_reserves: bigint; virtual_quote_reserves: bigint }> },
+  mint: string,
+  tokenAmount: bigint,
+): bigint | null {
+  const curve = state.curves.get(mint);
+  if (curve === undefined) return null;
+  if (curve.virtual_token_reserves <= 0n || curve.virtual_quote_reserves <= 0n) return null;
+  return (tokenAmount * curve.virtual_quote_reserves) / curve.virtual_token_reserves;
+}
+
+function hasPending(state: { pending: Map<string, { order: { mint: string; side: string } }> }, mint: string, side: string): boolean {
+  for (const p of state.pending.values()) {
+    if (p.order.mint === mint && p.order.side === side) return true;
   }
+  return false;
 }
 
-function refreshFromCurve(state: any, s: MintStats): void {
-  const c = state.curves?.get?.(s.mint);
-  if (!c) return;
-  if (c.complete) s.complete = true;
-  const vSol = big(pick(c, 'virtual_sol_reserves', 'virtualSolReserves'));
-  const vTok = big(pick(c, 'virtual_token_reserves', 'virtualTokenReserves'));
-  if (vSol !== undefined && vTok !== undefined && vTok > 0n) { s.priceNum = vSol; s.priceDen = vTok; }
-  const rs = big(pick(c, 'real_sol_reserves', 'realSolReserves'));
-  if (rs !== undefined) s.realSol = rs;
+function costExposure(state: { positions: Map<string, { cost_lamports: bigint }> }): bigint {
+  let total = 0n;
+  for (const pos of state.positions.values()) total += pos.cost_lamports;
+  return total;
 }
 
-function markValue(s: MintStats | undefined, tokens: bigint, fallbackCost: bigint): bigint {
-  if (!s || s.priceDen === 0n) return fallbackCost;
-  return (tokens * s.priceNum) / s.priceDen;
-}
+await runBot({
+  onBatch(state, batch) {
+    batchCounter += 1;
+    const caps = state.hello.caps;
+    const fee = state.txFeeLamports();
+    const orders: OrderInput[] = [];
 
-function recentFlowSum(s: MintStats): bigint {
-  let t = 0n;
-  for (const f of s.recentFlow) t += f;
-  return t;
-}
-
-function posOf(state: any, mint: string): { tokens: bigint; cost: bigint } | undefined {
-  const p = state.positions?.get?.(mint);
-  if (!p) return undefined;
-  const tokens = big(p.token_amount) ?? 0n;
-  if (tokens <= 0n) return undefined;
-  return { tokens, cost: big(p.cost_lamports) ?? 0n };
-}
-
-function capSellTokens(state: any, s: MintStats | undefined, tokens: bigint, value: bigint): bigint {
-  const bps = big(state.hello?.caps?.max_order_bps_of_real_reserve);
-  if (!s || bps === undefined || bps <= 0n || s.realSol <= 0n || value <= 0n) return tokens;
-  const maxVal = (s.realSol * bps) / 10000n;
-  if (value <= maxVal) return tokens;
-  const t = (tokens * maxVal) / value;
-  return t > 0n ? t : tokens;
-}
-
-// ───────────────────────── Bot ─────────────────────────
-runBot({
-  onBatch(state: any, batch: any): any[] {
-    batchNo++;
-    const caps = state.hello?.caps ?? {};
-    const maxOrders = Math.max(0, Number(caps.max_orders_per_batch ?? 1));
-    const maxOpen = Math.min(5, Number(caps.max_open_positions ?? 5));
-    const orders: any[] = [];
-    // 1. Ingest events in tape order
-    const flow = new Map<string, bigint>();
-    for (const ev of batch?.events ?? []) ingest(ev, flow);
-    for (const s of stats.values()) {
-      s.recentFlow.push(flow.get(s.mint) ?? 0n);
-      if (s.recentFlow.length > 5) s.recentFlow.shift();
+    // Learn from fills first: a filled sell closes a round trip.
+    for (const fill of batch.fills) {
+      if (fill.side === 'sell' && fill.status === 'filled') {
+        roundTripsDone.add(fill.mint);
+        notes.delete(fill.mint);
+      }
+      if (fill.side === 'buy' && fill.status === 'filled') {
+        // Lane was recorded when the order was sent; keep the note.
+        if (!notes.has(fill.mint)) noteFor(fill.mint, 'quota');
+      }
     }
-    // 2. Reconcile positions with our metadata (sorted for determinism)
-    const metaMints = Array.from(meta.keys()).sort(cmpStr);
-    for (const mint of metaMints) {
-      const m = meta.get(mint)!;
-      const s = stats.get(mint);
-      if (s) refreshFromCurve(state, s);
-      const p = posOf(state, mint);
-      if (p) {
-        m.filled = true;
+
+    // Fold this batch's events into the watch ledger.
+    for (const ev of batch.events) {
+      if (ev.event === 'CreateEvent') {
+        if (!watched.has(ev.mint)) {
+          watched.set(ev.mint, {
+            creator: ev.creator,
+            bornAtBatch: batchCounter,
+            buyQuote: 0n,
+            sellQuote: 0n,
+            biggestBuy: 0n,
+            buyers: new Set<string>(),
+            tradesSeen: 0,
+            creatorHasSold: false,
+            flowAfterEntry: 0n,
+          });
+        }
         continue;
       }
-      if (m.sellBatch >= 0 || m.filled) {
-        // Position gone after selling → round trip closed
-        if (m.costIntent >= MIN_ROUND_TRIP) roundTripped.add(mint);
-        meta.delete(mint);
-      } else if (batchNo - m.entryBatch > PENDING_BUY_TIMEOUT_BATCHES) {
-        meta.delete(mint); // buy never filled
+      if (ev.event !== 'TradeEvent') continue;
+      let w = watched.get(ev.mint);
+      if (w === undefined) {
+        w = {
+          creator: ev.creator,
+          bornAtBatch: batchCounter,
+          buyQuote: 0n,
+          sellQuote: 0n,
+          biggestBuy: 0n,
+          buyers: new Set<string>(),
+          tradesSeen: 0,
+          creatorHasSold: false,
+          flowAfterEntry: 0n,
+        };
+        watched.set(ev.mint, w);
       }
-    }
-    // Positions we hold but have no meta for (defensive)
-    const heldMints: string[] = [];
-    const posKeys: string[] = [];
-    if (state.positions && typeof state.positions.keys === 'function') {
-      for (const k of state.positions.keys()) posKeys.push(String(k));
-    }
-    posKeys.sort(cmpStr);
-    for (const mint of posKeys) {
-      const p = posOf(state, mint);
-      if (!p) continue;
-      heldMints.push(mint);
-      if (!meta.has(mint)) {
-        meta.set(mint, { mint, entryBatch: batchNo, costIntent: p.cost, quota: false, filled: true, sellBatch: -1, sellAttempts: 0, });
-        everEntered.add(mint);
-      }
-    }
-    // 3. Equity estimate
-    let free = big(state.freeCashLamports?.()) ?? 0n;
-    let marked = 0n;
-    let exposureCost = 0n;
-    for (const mint of heldMints) {
-      const p = posOf(state, mint)!;
-      marked += markValue(stats.get(mint), p.tokens, p.cost);
-      exposureCost += p.cost;
-    }
-    for (const m of meta.values()) if (!m.filled) exposureCost += m.costIntent;
-    const equity = free + marked;
-    // 4. Exits (priority over entries)
-    const sellingNow = new Set<string>();
-    for (const mint of heldMints) {
-      if (orders.length >= maxOrders) break;
-      const p = posOf(state, mint)!;
-      const m = meta.get(mint)!;
-      const s = stats.get(mint);
-      const value = markValue(s, p.tokens, p.cost);
-      const cost = p.cost > 0n ? p.cost : m.costIntent;
-      const held = batchNo - m.entryBatch;
-      let exit = false;
-      if (s?.complete) exit = true;
-      else if (s && s.realSol >= COMPLETION_GUARD_RESERVE) exit = true;
-      else if (cost > 0n && value * 10000n >= cost * (10000n + TAKE_PROFIT_BPS)) exit = true;
-      else if (cost > 0n && value * 10000n <= cost * (10000n - STOP_LOSS_BPS)) exit = true;
-      else if (held >= (m.quota ? QUOTA_TIME_STOP_BATCHES : TIME_STOP_BATCHES)) exit = true;
-      else if (s && s.creatorSold && !m.quota) exit = true;
-      else if (s && recentFlowSum(s) <= NEG_FLOW_EXIT) exit = true;
-      if (!exit) continue;
-      if (m.sellBatch >= 0 && batchNo - m.sellBatch < SELL_RETRY_AFTER_BATCHES) continue;
-      const retry = m.sellAttempts > 0;
-      const tokens = capSellTokens(state, s, p.tokens, value);
-      if (tokens <= 0n) continue;
-      orders.push({
-        side: 'sell', mint, token_amount: tokens,
-        max_slippage_bps: retry ? SELL_RETRY_SLIPPAGE_BPS : SELL_SLIPPAGE_BPS,
-      });
-      m.sellBatch = batchNo;
-      m.sellAttempts++;
-      sellingNow.add(mint);
-    }
-    // 5. Entries
-    if (orders.length >= maxOrders) return orders;
-    const committed = Number(state.committedPositionCount?.() ?? 0);
-    let openCount = Math.max(committed, meta.size);
-    const fee = big(state.txFeeLamports?.()) ?? 0n;
-    const inFlightQuota = Array.from(meta.values()).filter(m => m.quota).length;
-    const quotaNeeded = roundTripped.size + inFlightQuota < QUOTA_TARGET;
-    const momentumAllowed = equity >= QUOTA_ONLY_EQUITY;
-    const candidates: { mint: string; score: bigint; momentum: boolean }[] = [];
-    const statMints = Array.from(stats.keys()).sort(cmpStr);
-    for (const mint of statMints) {
-      const s = stats.get(mint)!;
-      if (everEntered.has(mint) || roundTripped.has(mint) || meta.has(mint)) continue;
-      refreshFromCurve(state, s);
-      if (s.complete || s.priceDen === 0n) continue;
-      const age = batchNo - s.createdBatch;
-      if (s.creatorSold) continue;
-      const momentum =
-        momentumAllowed &&
-        age <= MAX_ENTRY_AGE_BATCHES &&
-        s.trades >= OBS_MIN_TRADES &&
-        s.netInflow >= MIN_NET_INFLOW &&
-        s.buyers.size >= MIN_DISTINCT_BUYERS &&
-        s.grossBuy > 0n &&
-        s.maxBuyTrade * 10000n <= s.grossBuy * MAX_SINGLE_TRADE_SHARE_BPS &&
-        (s.realSol === 0n || s.realSol <= MAX_REAL_RESERVE_AT_ENTRY);
-      const quotaOk =
-        quotaNeeded && age <= QUOTA_MAX_AGE_BATCHES && s.trades >= QUOTA_MIN_TRADES &&
-        s.netInflow > 0n && (s.realSol === 0n || s.realSol < COMPLETION_GUARD_RESERVE);
-      if (!momentum && !quotaOk) continue;
-      candidates.push({ mint, score: s.netInflow + BigInt(s.buyers.size) * (SOL / 10n), momentum });
-    }
-    candidates.sort((a, b) => {
-      if (a.momentum !== b.momentum) return a.momentum ? -1 : 1;
-      if (a.score !== b.score) return a.score > b.score ? -1 : 1;
-      return cmpStr(a.mint, b.mint);
-    });
-    for (const c of candidates) {
-      if (orders.length >= maxOrders) break;
-      if (openCount >= maxOpen) break;
-      // keep one slot for quota trades while quota unmet
-      if (c.momentum && quotaNeeded && openCount >= maxOpen - 1) continue;
-      let size: bigint;
-      if (c.momentum) {
-        size = minB(BASE_SIZE, (equity * MAX_SIZE_BPS_OF_EQUITY) / 10000n);
-        if (equity < HALF_SIZE_EQUITY) size = size / 2n;
-        if (exposureCost + size > MAX_TOTAL_EXPOSURE) continue;
+      const amount = BigInt(ev.quote_amount ?? ev.sol_amount);
+      w.tradesSeen += 1;
+      if (ev.is_buy) {
+        w.buyQuote += amount;
+        w.buyers.add(ev.user);
+        if (amount > w.biggestBuy) w.biggestBuy = amount;
       } else {
-        size = QUOTA_SIZE;
+        w.sellQuote += amount;
+        if (ev.user === w.creator) w.creatorHasSold = true;
       }
-      const capBuy = big(state.maxBuyLamports?.(c.mint));
-      if (capBuy !== undefined) size = minB(size, capBuy);
-      const spendable = free - FEE_RESERVE - fee * 2n;
-      if (spendable <= 0n) break;
-      size = minB(size, spendable);
-      if (size < MIN_ROUND_TRIP) continue;
-      orders.push({ side: 'buy', mint: c.mint, quote_lamports: size, max_slippage_bps: BUY_SLIPPAGE_BPS });
-      meta.set(c.mint, {
-        mint: c.mint, entryBatch: batchNo, costIntent: size, quota: !c.momentum,
-        filled: false, sellBatch: -1, sellAttempts: 0,
-      });
-      everEntered.add(c.mint);
-      free -= size + fee;
-      exposureCost += size;
-      openCount++;
+      if (notes.has(ev.mint)) {
+        w.flowAfterEntry += ev.is_buy ? amount : -amount;
+      }
     }
+
+    // ---- exits before entries --------------------------------------
+    for (const [mint, pos] of state.positions) {
+      if (orders.length >= caps.max_orders_per_batch) break;
+      if (hasPending(state, mint, 'sell')) continue;
+      const note = notes.get(mint) ?? noteFor(mint, 'quota');
+      const heldFor = batchCounter - note.openedAtBatch;
+      const value = spotValue(state, mint, pos.token_amount);
+      let wantOut = note.exitWanted;
+      if (value !== null && pos.cost_lamports > 0n) {
+        if (value * 10n >= pos.cost_lamports * 14n) wantOut = true; // +40%
+        if (value * 10n <= pos.cost_lamports * 8n) wantOut = true; // -20%
+      }
+      const w = watched.get(mint);
+      if (w !== undefined && w.creatorHasSold) wantOut = true;
+      if (w !== undefined && w.flowAfterEntry < 0n && heldFor > 5) wantOut = true;
+      // Completion guard: a curve approaching migration can gap, so
+      // leave while there is still a reserve to sell into.
+      const curveNow = state.curves.get(mint);
+      if (curveNow !== undefined && curveNow.real_quote_reserves >= COMPLETION_RESERVE) wantOut = true;
+      if (curveNow !== undefined && curveNow.complete) wantOut = true;
+      const limit = note.lane === 'quota' ? QUOTA_HOLD_BATCHES : MOMENTUM_HOLD_BATCHES;
+      if (heldFor >= limit) wantOut = true;
+      if (!wantOut) continue;
+      note.exitWanted = true;
+      orders.push({
+        side: 'sell',
+        mint,
+        token_amount: pos.token_amount,
+        max_slippage_bps: exitSlippage(note.sellAttempts),
+      });
+      note.sellAttempts += 1;
+    }
+
+    // ---- shared budget view ----------------------------------------
+    let free = state.freeCashLamports();
+    let openSlots = caps.max_open_positions - state.committedPositionCount();
+    let exposure = costExposure(state);
+    const reserveRoom = (mint: string, want: bigint): bigint => {
+      const cap = state.maxBuyLamports(mint);
+      return cap < want ? cap : want;
+    };
+    const canAfford = (amount: bigint): boolean =>
+      orders.length < caps.max_orders_per_batch && openSlots > 0 && free >= amount + fee && amount > 0n;
+
+    // ---- quota lane --------------------------------------------------
+    // Fill the twenty-coin bar early while it is cheap to do so. One
+    // slot is effectively shared: quota only takes a slot when a round
+    // trip is still missing and the coin shows at least a little life.
+    if (roundTripsDone.size + countActiveQuota() < QUOTA_TARGET) {
+      for (const [mint, w] of watched) {
+        if (orders.length >= caps.max_orders_per_batch) break;
+        if (quotaAttempted.has(mint) || momentumAttempted.has(mint)) continue;
+        if (state.positions.has(mint) || hasPending(state, mint, 'buy')) continue;
+        const curve = state.curves.get(mint);
+        if (curve === undefined || curve.complete) continue;
+        if (w.tradesSeen < 3) continue;
+        if (w.creatorHasSold) continue;
+        const amount = reserveRoom(mint, QUOTA_STAKE);
+        if (amount < LAMPORTS_PER_SOL / 100n) continue;
+        if (!canAfford(amount)) break;
+        quotaAttempted.add(mint);
+        noteFor(mint, 'quota');
+        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: BASE_SLIPPAGE_BPS });
+        free -= amount + fee;
+        openSlots -= 1;
+        exposure += amount;
+        break; // at most one new quota coin per batch keeps flow readable
+      }
+    }
+
+    // ---- momentum lane ----------------------------------------------
+    // Equity throttle: a drawdown shrinks momentum first and stops it
+    // entirely before it can threaten the drawdown guardrail. The
+    // quota lane above is unaffected, since its trips are tiny.
+    const equityNow = markedEquity(state);
+    if (equityNow < EQUITY_HARD_FLOOR) return orders;
+    const sizeScale = equityNow < EQUITY_SOFT_FLOOR ? 2n : 1n;
+    for (const [mint, w] of watched) {
+      if (orders.length >= caps.max_orders_per_batch) break;
+      if (momentumAttempted.has(mint) || quotaAttempted.has(mint)) continue;
+      if (state.positions.has(mint) || hasPending(state, mint, 'buy')) continue;
+      const curve = state.curves.get(mint);
+      if (curve === undefined || curve.complete) continue;
+      if (curve.real_quote_reserves > MAX_YOUNG_RESERVE) continue;
+      if (w.creatorHasSold) continue;
+      const net = w.buyQuote - w.sellQuote;
+      if (net < MIN_NET_INFLOW) continue;
+      if (w.buyers.size < MIN_DISTINCT_BUYERS) continue;
+      if (w.buyQuote > 0n && w.biggestBuy * 10n > w.buyQuote * 3n) continue;
+      if (exposure >= EXPOSURE_CEILING) break;
+      let stake = MOMENTUM_STAKE / sizeScale;
+      // The 3%-of-bankroll guide: never let one momentum ticket exceed
+      // three percent of the starting capital either.
+      const bankrollCap = (LAMPORTS_PER_SOL * 10n * 3n) / 100n;
+      if (stake > bankrollCap) stake = bankrollCap;
+      const room = EXPOSURE_CEILING - exposure;
+      if (stake > room) stake = room;
+      const amount = reserveRoom(mint, stake);
+      if (amount < LAMPORTS_PER_SOL / 100n) continue;
+      if (!canAfford(amount)) continue;
+      momentumAttempted.add(mint);
+      noteFor(mint, 'momentum');
+      orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: BASE_SLIPPAGE_BPS });
+      free -= amount + fee;
+      openSlots -= 1;
+      exposure += amount;
+    }
+
     return orders;
   },
 });
+
+function countActiveQuota(): number {
+  let n = 0;
+  for (const note of notes.values()) if (note.lane === 'quota') n += 1;
+  return n;
+}
